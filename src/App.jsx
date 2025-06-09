@@ -1,4 +1,4 @@
-// Fixed App.jsx - Key changes for surface detection
+// Fixed App.jsx - Corrected surface detection implementation
 
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
@@ -17,7 +17,8 @@ function App() {
     let model;
     let hitTestSource = null;
     let hitTestSourceRequested = false;
-    let localReferenceSpace = null; // Store reference space
+    let localReferenceSpace = null;
+    let viewerReferenceSpace = null; // Add viewer space for hit testing
     let reticle;
     let raycaster, mouse;
 
@@ -35,10 +36,10 @@ function App() {
       raycaster = new THREE.Raycaster();
       mouse = new THREE.Vector2();
 
-      // AR Button with REQUIRED hit-test feature
+      // AR Button with proper session options
       document.body.appendChild(createARButton(renderer, onSelect, {
-        requiredFeatures: ['local', 'hit-test'], // Make hit-test required!
-        optionalFeatures: ['anchors'],
+        requiredFeatures: ['local', 'hit-test'], // Both required for surface detection
+        optionalFeatures: ['anchors', 'dom-overlay'],
         cameraPreference: 'environment'
       }));
 
@@ -48,12 +49,13 @@ function App() {
       scene.add(light);
       scene.add(directionalLight);
 
-      // Create reticle (targeting indicator)
+      // Create reticle (targeting indicator) - Fixed geometry
       const reticleGeometry = new THREE.RingGeometry(0.15, 0.2, 32).rotateX(-Math.PI / 2);
       const reticleMaterial = new THREE.MeshBasicMaterial({ 
-        color: 0x00ff00, // Green color for better visibility
+        color: 0x00ff00,
         transparent: true,
-        opacity: 0.8
+        opacity: 0.8,
+        side: THREE.DoubleSide // Ensure visibility from both sides
       });
       reticle = new THREE.Mesh(reticleGeometry, reticleMaterial);
       reticle.matrixAutoUpdate = false;
@@ -88,21 +90,38 @@ function App() {
       hitTestSourceRequested = false;
       hitTestSource = null;
       
-      // Get the session and reference space
       const session = renderer.xr.getSession();
+      
       try {
+        // Get local reference space for drawing
         localReferenceSpace = await session.requestReferenceSpace('local');
         console.log('Local reference space acquired');
+        
+        // Get viewer reference space for hit testing - THIS IS CRITICAL
+        viewerReferenceSpace = await session.requestReferenceSpace('viewer');
+        console.log('Viewer reference space acquired');
+        
+        // Request hit test source using VIEWER space (not local!)
+        hitTestSource = await session.requestHitTestSource({ 
+          space: viewerReferenceSpace 
+        });
+        hitTestSourceRequested = true;
+        console.log('Hit test source created successfully');
+        
       } catch (error) {
-        console.error('Failed to get local reference space:', error);
+        console.error('Failed to setup XR spaces:', error);
       }
     };
 
     const onXRSessionEnd = () => {
       console.log('XR Session ended');
+      if (hitTestSource) {
+        hitTestSource.cancel();
+      }
       hitTestSource = null;
       hitTestSourceRequested = false;
       localReferenceSpace = null;
+      viewerReferenceSpace = null;
       reticle.visible = false;
     };
 
@@ -158,55 +177,49 @@ function App() {
         // WebXR mode - FIXED hit test logic
         const session = renderer.xr.getSession();
         
-        // Initialize hit test source if not done yet
-        if (!hitTestSourceRequested && localReferenceSpace) {
-          hitTestSourceRequested = true;
-          
-          // Request hit test source using local reference space
-          session.requestHitTestSource({ space: localReferenceSpace })
-            .then((source) => {
-              hitTestSource = source;
-              console.log('Hit test source created successfully');
-            })
-            .catch((error) => {
-              console.error('Failed to create hit test source:', error);
-              hitTestSourceRequested = false; // Allow retry
-            });
-        }
-
-        // Perform hit testing if source is available
-        if (hitTestSource) {
+        // Check if we have all required components
+        if (hitTestSource && localReferenceSpace) {
           try {
+            // Get hit test results
             const hitTestResults = frame.getHitTestResults(hitTestSource);
             
             if (hitTestResults.length > 0) {
+              // Get the first (closest) hit result
               const hit = hitTestResults[0];
+              
+              // Get pose relative to local reference space for drawing
               const hitPose = hit.getPose(localReferenceSpace);
               
               if (hitPose) {
-                // Store hit result for selection
+                // Store hit result for model placement
                 renderer.xr.hitResult = hit;
+                renderer.xr.hitPose = hitPose;
                 
-                // Update reticle position
+                // Update reticle position using the pose matrix
                 reticle.visible = true;
                 reticle.matrix.fromArray(hitPose.transform.matrix);
                 
-                // Debug: Log hit detection
-                console.log('Surface detected at:', {
-                  x: hitPose.transform.position.x.toFixed(3),
-                  y: hitPose.transform.position.y.toFixed(3),
-                  z: hitPose.transform.position.z.toFixed(3)
-                });
+                // Debug: Log hit detection (less frequent logging)
+                if (Math.random() < 0.1) { // Log 10% of frames
+                  console.log('Surface detected at:', {
+                    x: hitPose.transform.position.x.toFixed(3),
+                    y: hitPose.transform.position.y.toFixed(3),
+                    z: hitPose.transform.position.z.toFixed(3)
+                  });
+                }
               }
             } else {
+              // No surface detected
               reticle.visible = false;
               renderer.xr.hitResult = null;
+              renderer.xr.hitPose = null;
             }
           } catch (error) {
             console.error('Hit test error:', error);
+            reticle.visible = false;
           }
         } else {
-          // No hit test source yet
+          // Still waiting for hit test source or reference space
           reticle.visible = false;
         }
       } else if (!renderer.xr.isPresenting) {
@@ -219,7 +232,7 @@ function App() {
       renderer.render(scene, camera);
     };
 
-    const placeModel = (position) => {
+    const placeModel = (position, orientation = null) => {
       if (!modelUrl) return;
 
       loader.load(modelUrl, (gltf) => {
@@ -231,8 +244,16 @@ function App() {
         model = gltf.scene;
         model.scale.set(0.5, 0.5, 0.5);
         
+        // Set position
         model.position.copy(position);
-        model.position.y += 0.01; // Slight offset above surface
+        
+        // Set orientation if provided (from hit test)
+        if (orientation) {
+          model.quaternion.copy(orientation);
+        }
+        
+        // Slight offset above surface to prevent z-fighting
+        model.position.y += 0.01;
         
         scene.add(model);
         
@@ -247,31 +268,38 @@ function App() {
     };
 
     const onSelect = async () => {
-      if (!modelUrl) return;
+      if (!modelUrl) {
+        console.log('No model loaded');
+        return;
+      }
 
       if (renderer.xr.isPresenting) {
-        // WebXR mode - FIXED selection logic
-        if (!renderer.xr.hitResult || !localReferenceSpace) {
-          console.log('No hit result or reference space available');
-          return;
-        }
-
-        try {
-          const hitPose = renderer.xr.hitResult.getPose(localReferenceSpace);
-          
-          if (hitPose) {
+        // WebXR mode - use stored hit result
+        if (renderer.xr.hitResult && renderer.xr.hitPose) {
+          try {
+            const hitPose = renderer.xr.hitPose;
+            
             const position = new THREE.Vector3(
               hitPose.transform.position.x,
               hitPose.transform.position.y,
               hitPose.transform.position.z
             );
             
-            placeModel(position);
-          } else {
-            console.log('No valid hit pose available');
+            const orientation = new THREE.Quaternion(
+              hitPose.transform.orientation.x,
+              hitPose.transform.orientation.y,
+              hitPose.transform.orientation.z,
+              hitPose.transform.orientation.w
+            );
+            
+            placeModel(position, orientation);
+            console.log('Model placed via surface detection');
+            
+          } catch (error) {
+            console.error('Error placing model:', error);
           }
-        } catch (error) {
-          console.error('Error placing model:', error);
+        } else {
+          console.log('No surface detected - move device to find a surface');
         }
       }
       // For fallback mode, placement is handled by click/touch events
@@ -324,6 +352,28 @@ function App() {
         Upload .glb
         <input type="file" accept=".glb" onChange={handleUpload} hidden />
       </label>
+      
+      {/* Instructions overlay */}
+      <div style={{
+        position: 'absolute',
+        top: '70px',
+        left: '20px',
+        right: '20px',
+        padding: '10px',
+        backgroundColor: 'rgba(0, 0, 0, 0.7)',
+        color: 'white',
+        borderRadius: '5px',
+        fontSize: '14px',
+        zIndex: 1000,
+        display: sceneReady ? 'block' : 'none'
+      }}>
+        <strong>Instructions:</strong><br/>
+        1. Upload a .glb model<br/>
+        2. Start AR and point at a flat surface<br/>
+        3. Look for the green reticle (circle)<br/>
+        4. Tap screen or trigger to place model
+      </div>
+      
       {!sceneReady && (
         <div style={{
           position: 'absolute',
