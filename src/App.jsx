@@ -1,3 +1,5 @@
+// Fixed App.jsx - Key changes for surface detection
+
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
@@ -15,6 +17,7 @@ function App() {
     let model;
     let hitTestSource = null;
     let hitTestSourceRequested = false;
+    let localReferenceSpace = null; // Store reference space
     let reticle;
     let raycaster, mouse;
 
@@ -32,10 +35,10 @@ function App() {
       raycaster = new THREE.Raycaster();
       mouse = new THREE.Vector2();
 
-      // AR Button
+      // AR Button with REQUIRED hit-test feature
       document.body.appendChild(createARButton(renderer, onSelect, {
-        optionalFeatures: ['hit-test'],
-        requiredFeatures: ['local'],
+        requiredFeatures: ['local', 'hit-test'], // Make hit-test required!
+        optionalFeatures: ['anchors'],
         cameraPreference: 'environment'
       }));
 
@@ -48,9 +51,9 @@ function App() {
       // Create reticle (targeting indicator)
       const reticleGeometry = new THREE.RingGeometry(0.15, 0.2, 32).rotateX(-Math.PI / 2);
       const reticleMaterial = new THREE.MeshBasicMaterial({ 
-        color: 0xffffff,
+        color: 0x00ff00, // Green color for better visibility
         transparent: true,
-        opacity: 0.6
+        opacity: 0.8
       });
       reticle = new THREE.Mesh(reticleGeometry, reticleMaterial);
       reticle.matrixAutoUpdate = false;
@@ -70,10 +73,37 @@ function App() {
       camera.position.set(0, 1.6, 3);
       camera.lookAt(0, 0, 0);
 
+      // Setup XR session events
+      renderer.xr.addEventListener('sessionstart', onXRSessionStart);
+      renderer.xr.addEventListener('sessionend', onXRSessionEnd);
+
       renderer.setAnimationLoop(render);
 
       // Handle window resize
       window.addEventListener('resize', onWindowResize);
+    };
+
+    const onXRSessionStart = async () => {
+      console.log('XR Session started');
+      hitTestSourceRequested = false;
+      hitTestSource = null;
+      
+      // Get the session and reference space
+      const session = renderer.xr.getSession();
+      try {
+        localReferenceSpace = await session.requestReferenceSpace('local');
+        console.log('Local reference space acquired');
+      } catch (error) {
+        console.error('Failed to get local reference space:', error);
+      }
+    };
+
+    const onXRSessionEnd = () => {
+      console.log('XR Session ended');
+      hitTestSource = null;
+      hitTestSourceRequested = false;
+      localReferenceSpace = null;
+      reticle.visible = false;
     };
 
     const onWindowResize = () => {
@@ -124,39 +154,66 @@ function App() {
     };
 
     const render = (timestamp, frame) => {
-      if (frame) {
-        // WebXR mode
+      if (frame && renderer.xr.isPresenting) {
+        // WebXR mode - FIXED hit test logic
         const session = renderer.xr.getSession();
         
-        if (hitTestSourceRequested === false) {
-          session.requestReferenceSpace('viewer').then((referenceSpace) => {
-            session.requestHitTestSource({ space: referenceSpace }).then((source) => {
-              hitTestSource = source;
-            });
-          });
+        // Initialize hit test source if not done yet
+        if (!hitTestSourceRequested && localReferenceSpace) {
           hitTestSourceRequested = true;
+          
+          // Request hit test source using local reference space
+          session.requestHitTestSource({ space: localReferenceSpace })
+            .then((source) => {
+              hitTestSource = source;
+              console.log('Hit test source created successfully');
+            })
+            .catch((error) => {
+              console.error('Failed to create hit test source:', error);
+              hitTestSourceRequested = false; // Allow retry
+            });
         }
 
+        // Perform hit testing if source is available
         if (hitTestSource) {
-          const hitTestResults = frame.getHitTestResults(hitTestSource);
-          
-          if (hitTestResults.length) {
-            const hit = hitTestResults[0];
-            renderer.xr.hitResult = hit;
+          try {
+            const hitTestResults = frame.getHitTestResults(hitTestSource);
             
-            reticle.visible = true;
-            reticle.matrix.fromArray(hit.getPose(session.getReferenceSpace()).transform.matrix);
-          } else {
-            reticle.visible = false;
+            if (hitTestResults.length > 0) {
+              const hit = hitTestResults[0];
+              const hitPose = hit.getPose(localReferenceSpace);
+              
+              if (hitPose) {
+                // Store hit result for selection
+                renderer.xr.hitResult = hit;
+                
+                // Update reticle position
+                reticle.visible = true;
+                reticle.matrix.fromArray(hitPose.transform.matrix);
+                
+                // Debug: Log hit detection
+                console.log('Surface detected at:', {
+                  x: hitPose.transform.position.x.toFixed(3),
+                  y: hitPose.transform.position.y.toFixed(3),
+                  z: hitPose.transform.position.z.toFixed(3)
+                });
+              }
+            } else {
+              reticle.visible = false;
+              renderer.xr.hitResult = null;
+            }
+          } catch (error) {
+            console.error('Hit test error:', error);
           }
+        } else {
+          // No hit test source yet
+          reticle.visible = false;
         }
-      } else {
+      } else if (!renderer.xr.isPresenting) {
         // Fallback mode - show reticle at center
-        if (!renderer.xr.isPresenting) {
-          reticle.visible = true;
-          reticle.position.set(0, 0, -2);
-          reticle.lookAt(camera.position);
-        }
+        reticle.visible = true;
+        reticle.position.set(0, 0, -2);
+        reticle.lookAt(camera.position);
       }
 
       renderer.render(scene, camera);
@@ -193,21 +250,28 @@ function App() {
       if (!modelUrl) return;
 
       if (renderer.xr.isPresenting) {
-        // WebXR mode
-        const session = renderer.xr.getSession();
-        if (!session || !renderer.xr.hitResult) return;
+        // WebXR mode - FIXED selection logic
+        if (!renderer.xr.hitResult || !localReferenceSpace) {
+          console.log('No hit result or reference space available');
+          return;
+        }
 
-        const hitPose = renderer.xr.hitResult.getPose(session.getReferenceSpace());
-        
-        if (hitPose) {
-          const position = new THREE.Vector3();
-          const quaternion = new THREE.Quaternion();
-          const matrix = new THREE.Matrix4();
+        try {
+          const hitPose = renderer.xr.hitResult.getPose(localReferenceSpace);
           
-          matrix.fromArray(hitPose.transform.matrix);
-          matrix.decompose(position, quaternion, new THREE.Vector3());
-          
-          placeModel(position);
+          if (hitPose) {
+            const position = new THREE.Vector3(
+              hitPose.transform.position.x,
+              hitPose.transform.position.y,
+              hitPose.transform.position.z
+            );
+            
+            placeModel(position);
+          } else {
+            console.log('No valid hit pose available');
+          }
+        } catch (error) {
+          console.error('Error placing model:', error);
         }
       }
       // For fallback mode, placement is handled by click/touch events
@@ -219,6 +283,14 @@ function App() {
       window.removeEventListener('resize', onWindowResize);
       renderer?.domElement.removeEventListener('click', onCanvasClick);
       renderer?.domElement.removeEventListener('touchend', onCanvasClick);
+      renderer?.xr?.removeEventListener('sessionstart', onXRSessionStart);
+      renderer?.xr?.removeEventListener('sessionend', onXRSessionEnd);
+      
+      // Clean up hit test source
+      if (hitTestSource) {
+        hitTestSource.cancel();
+      }
+      
       renderer?.dispose();
     };
   }, [sceneReady, modelUrl]);
